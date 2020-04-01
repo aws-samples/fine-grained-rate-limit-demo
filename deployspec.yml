@@ -1,0 +1,21 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: 3.7
+      nodejs: 10
+  pre_build:
+    commands:
+      - npm install cdk@1.30.0 -g -y --quiet --no-progress
+      - pip install -r requirements.txt --quiet
+  build:
+    commands:
+      - export ROLE=arn:aws:iam::$TARGET_ACCOUNT_ID:role/deploy-role-rate-limit-demo
+      - temp_role=$(aws sts assume-role --role-arn $ROLE  --role-session-name $TARGET_ACCOUNT_ID-$ADF_PROJECT_NAME)
+      - export AWS_ACCESS_KEY_ID=$(echo $temp_role | jq -r .Credentials.AccessKeyId)
+      - export AWS_SECRET_ACCESS_KEY=$(echo $temp_role | jq -r .Credentials.SecretAccessKey)
+      - export AWS_SESSION_TOKEN=$(echo $temp_role | jq -r .Credentials.SessionToken)
+      - export CDK_DEPLOY_ACCOUNT=$TARGET_ACCOUNT_ID
+      - export CDK_DEPLOY_REGION=$region
+      - echo Deploying to account=$CDK_DEPLOY_ACCOUNT region=$CDK_DEPLOY_REGION
+      - cdk deploy rate-limit-demo --require-approval never
