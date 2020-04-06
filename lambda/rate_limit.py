@@ -30,6 +30,8 @@ class UsagePlan:
             self.number_bucket_shards = int(math.ceil(rate_limit/self.max_rate))
         else:
             self.type = 'TokenBucket'
+            #burst_rate needs to be at least 2*rate_limit.
+            self.burst_rate = self.burst_rate if self.burst_rate > 2 * self.rate_limit else 2 * self.rate_limit
             self.condition_expression = token_buket_condition_expression
             self.update_expression = token_update_expression
             self.number_bucket_shards = int(math.ceil(burst_rate/self.max_rate))
