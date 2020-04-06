@@ -149,15 +149,17 @@ class RateLimit:
             #Refill bucket
             rate_limit_per_shard = usage_plan.base_tokens_per_shard[bucket_shard_id]
             burst_rate_per_shard = usage_plan.burst_tokens_per_shard[bucket_shard_id]
+            attributes = {
+                    ':now': now,
+                    ':rate_limit': rate_limit_per_shard,
+                }
+            if usage_plan.type is 'TokenBucket':
+                attributes[':refil_cap'] =  burst_rate_per_shard - rate_limit_per_shard 
             self.buckets_table.update_item(
                 Key={'bucket_id': bucket_id, 'bucket_shard_id': bucket_shard_id},
                 UpdateExpression=usage_plan.update_expression,
                 ConditionExpression=usage_plan.condition_expression,
-                ExpressionAttributeValues={
-                    ':now': now,
-                    ':rate_limit': rate_limit_per_shard,
-                    ':refil_cap': burst_rate_per_shard - rate_limit_per_shard ,
-                },
+                ExpressionAttributeValues=attributes,
                 ReturnValues='ALL_NEW'
             )
         except botocore.exceptions.ClientError as e:
