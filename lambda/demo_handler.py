@@ -1,6 +1,8 @@
 from rate_limit import RateLimit, UsagePlan
-usage_plan = UsagePlan(10, 50)
+
+usage_plan = UsagePlan(1500, 2000)
 rate_limit = RateLimit(log_metrics=True)
+
 def handler(event, context):
     if rate_limit.should_throttle(event['requestContext']['identity']['sourceIp'], usage_plan):
         return {

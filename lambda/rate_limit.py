@@ -5,16 +5,21 @@ import math
 import random
 import datetime
 import json
+import uuid
+from botocore.config import Config
 
 table_name = 'buckets_table'
-leaky_buket_condition_expression = ':now > last_updated OR attribute_not_exists(bucket_id) AND :rate_limit > :burst_rate'
+leaky_buket_condition_expression = ':now > last_updated OR attribute_not_exists(bucket_id)'
 leaky_buket_update_expression = 'SET token_count = :rate_limit'
-token_buket_condition_expression = 'attribute_not_exists(bucket_id) OR ( :now > last_updated AND attribute_exists(token_count) AND token_count < :burst_rate )'
-token_update_expression = 'ADD token_count  :rate_limit'
-MAX_RATE=250*60
+token_buket_condition_expression = 'attribute_not_exists(bucket_id) OR ( :now > last_updated AND (token_count < :refil_cap ) )'
+token_update_expression = 'ADD token_count :rate_limit'
+
 
 class UsagePlan:
-    def __init__(self, rate_limit, burst_rate=0):
+    """UsagePlan defines how RateLimit should throttle requests."""
+    def __init__(self, rate_limit, burst_rate=0, granularity_in_sec=60):
+        self.granularity_in_sec = granularity_in_sec
+        self.max_rate = 500 * self.granularity_in_sec
         self.rate_limit = rate_limit
         self.burst_rate = burst_rate
 
@@ -22,12 +27,12 @@ class UsagePlan:
             self.type = 'LeakyBucket'
             self.condition_expression = leaky_buket_condition_expression
             self.update_expression = leaky_buket_update_expression
-            self.number_bucket_shards = int(math.ceil(rate_limit/MAX_RATE))
+            self.number_bucket_shards = int(math.ceil(rate_limit/self.max_rate))
         else:
             self.type = 'TokenBucket'
             self.condition_expression = token_buket_condition_expression
             self.update_expression = token_update_expression
-            self.number_bucket_shards = int(math.ceil(burst_rate/MAX_RATE))
+            self.number_bucket_shards = int(math.ceil(burst_rate/self.max_rate))
 
         self.base_tokens_per_shard = self.distribute(self.rate_limit, self.number_bucket_shards)
         self.burst_tokens_per_shard = self.distribute(self.burst_rate, self.number_bucket_shards)
@@ -37,9 +42,24 @@ class UsagePlan:
         return [base + (i < extra) for i in range(bucket_shard_count)]
 
 class RateLimit:
+    """
+    RateLimit implements Leaky Bucket and Token Bucket algorithms. The implementation is distributed 
+    and backed by DynamoDB.
+    """
 
     def __init__(self, log_metrics=False):
-        self.dynamodb_resource = boto3.resource('dynamodb', 'eu-west-1')
+
+        """
+        RateLimit tries to create its own DynamoDB table if its missing. Its mandator to have 
+        'dynamodb:DescribeTable' permissions for the executing role, 'dynamodb:CreateTable' is 
+        optional if the table is pre-provisioned.
+        """
+
+        self.dynamodb_resource = boto3.resource(
+            'dynamodb', 
+            'eu-west-1', 
+            config=Config(retries={'max_attempts': 1})
+        )
         dynamodb_client = boto3.client('dynamodb')
 
         try:
@@ -77,51 +97,73 @@ class RateLimit:
                 BillingMode='PAY_PER_REQUEST'
             )
         except botocore.exceptions.ClientError as e:
-            print(e.response['Error']['Code'])
             raise  
-                              
 
     def should_throttle(self, bucket_id, usage_plan):
+        """
+        The bucket containing the tokens is sharded, for scaleability. First draw a random shard 
+        id from which to pick tokens. Tokens are picked from bucket_shards at random and if the 
+        shard is empty throttle True is returned. Since the buckets are drawn at random not round
+        robin, some throttling can happen before the full bucket is depleted of tokens.
+        """
         bucket_shard_ids = list(range(0, usage_plan.number_bucket_shards))
         random.shuffle(bucket_shard_ids)
+        bucket_shard_id = bucket_shard_ids.pop()
+
+        throttle_by_ddb = False
+        throttle = True
 
         try:
-            while len(bucket_shard_ids):
-                bucket_shard_id = bucket_shard_ids.pop()
-                token = self.get_token(bucket_id, bucket_shard_id, usage_plan)
-
-                if token.get('Attributes',{}).get('token_count',0) > 0:
-                    return False
-
+            token = self.get_token(bucket_id, bucket_shard_id, usage_plan)
+            tokens_in_bucket_shard = token.get('Attributes',{}).get('token_count', 0)
+            throttle = tokens_in_bucket_shard <= 0
         except botocore.exceptions.ClientError as e:
             if e.response['Error']['Code'] != 'ThrottlingException':
                 raise 
-        
+            else:
+                throttle_by_ddb = True
+                
         if self.log_metrics:
-            self.log_throttle_metrics(bucket_id)
-
-        return True
+            self.log_throttle_metrics(
+                bucket_id,  
+                throttle=throttle, 
+                throttle_by_ddb=throttle_by_ddb,
+            )
+        return throttle
 
     def get_token(self, bucket_id, bucket_shard_id, usage_plan):
-        now = int(time.time() / 60)
+        """
+        Since this implememntation is for a distributed and scaled system there is no
+        cron process ticking and refilling the buckets. Before we take a token we need 
+        to try refil the bucket shard. We do a conditional update if the time has ticked
+        over. 
+
+        Once bucket has been refilled we reduce the token_count of the shard return the token.
+        """
+        now = int(time.time() / usage_plan.granularity_in_sec)
         token = {}
+
         try:
             #Refill bucket
+            rate_limit_per_shard = usage_plan.base_tokens_per_shard[bucket_shard_id]
+            burst_rate_per_shard = usage_plan.burst_tokens_per_shard[bucket_shard_id]
             self.buckets_table.update_item(
                 Key={'bucket_id': bucket_id, 'bucket_shard_id': bucket_shard_id},
                 UpdateExpression=usage_plan.update_expression,
                 ConditionExpression=usage_plan.condition_expression,
                 ExpressionAttributeValues={
                     ':now': now,
-                    ':rate_limit': usage_plan.base_tokens_per_shard[bucket_shard_id],
-                    ':burst_rate': usage_plan.burst_tokens_per_shard[bucket_shard_id],
+                    ':rate_limit': rate_limit_per_shard,
+                    ':refil_cap': burst_rate_per_shard - rate_limit_per_shard ,
                 },
                 ReturnValues='ALL_NEW'
             )
         except botocore.exceptions.ClientError as e:
             if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
                 raise 
+
         try:
+            #Reduce token count
             token =  self.buckets_table.update_item(
                 Key={'bucket_id': bucket_id, 'bucket_shard_id': bucket_shard_id},
                 ExpressionAttributeValues={':mod': -1, ':now': now, ':min_val': 0},
@@ -134,7 +176,20 @@ class RateLimit:
                 raise  
         return token
 
-    def log_throttle_metrics(self, bucket_id):
+    def log_throttle_metrics(self, bucket_id, throttle=False, throttle_by_ddb=False):
+        """
+        Metrics are logged using CloudWatch EMF format.
+        """
+        if throttle_by_ddb:
+            throttle_by_ddb_count = 1
+        else:
+            throttle_by_ddb_count = 0
+            
+        if throttle:
+            throttle_count = 1
+        else:
+            throttle_count = 0
+        
         print(json.dumps({
             '_aws': {
                 'CloudWatchMetrics': [
@@ -147,10 +202,21 @@ class RateLimit:
                                 'Unit': 'Count'
                             }
                         ],
+                    },{
+                        'Namespace': 'AWSSAMPLES/RateLimmit',
+                        'Dimensions': [['BucketId']],
+                        'Metrics': [
+                            {
+                                'Name': 'ThrottleByDynamoDB',
+                                'Unit': 'Count'
+                            }
+                        ],
                     }
                 ],
                 'Timestamp': int(datetime.datetime.now().timestamp()*1000)
             },
             'BucketId': bucket_id,
-            'Throttle': 1,
+            'Throttle': throttle_count,
+            'ThrottleByDynamoDB': throttle_by_ddb_count,
+            'requestId': str(uuid.uuid4()),
         }))
