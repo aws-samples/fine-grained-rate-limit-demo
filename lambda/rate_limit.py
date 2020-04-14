@@ -9,11 +9,6 @@ import uuid
 from botocore.config import Config
 
 table_name = 'buckets_table'
-leaky_buket_condition_expression = ':now > last_updated OR attribute_not_exists(bucket_id)'
-leaky_buket_update_expression = 'SET token_count = :rate_limit'
-token_buket_condition_expression = 'attribute_not_exists(bucket_id) OR ( :now > last_updated AND (token_count < :refil_cap ) )'
-token_update_expression = 'ADD token_count :rate_limit'
-
 
 class UsagePlan:
     """UsagePlan defines how RateLimit should throttle requests."""
@@ -25,15 +20,11 @@ class UsagePlan:
 
         if rate_limit >= burst_rate:
             self.type = 'LeakyBucket'
-            self.condition_expression = leaky_buket_condition_expression
-            self.update_expression = leaky_buket_update_expression
             self.number_bucket_shards = int(math.ceil(rate_limit/self.max_rate))
         else:
             self.type = 'TokenBucket'
             #burst_rate needs to be at least 2*rate_limit.
             self.burst_rate = self.burst_rate if self.burst_rate > 2 * self.rate_limit else 2 * self.rate_limit
-            self.condition_expression = token_buket_condition_expression
-            self.update_expression = token_update_expression
             self.number_bucket_shards = int(math.ceil(burst_rate/self.max_rate))
 
         self.base_tokens_per_shard = self.distribute(self.rate_limit, self.number_bucket_shards)
@@ -116,8 +107,7 @@ class RateLimit:
         throttle = True
 
         try:
-            token = self.get_token(bucket_id, bucket_shard_id, usage_plan)
-            tokens_in_bucket_shard = token.get('Attributes',{}).get('token_count', 0)
+            tokens_in_bucket_shard = self.get_token(bucket_id, bucket_shard_id, usage_plan)
             throttle = tokens_in_bucket_shard <= 0
         except botocore.exceptions.ClientError as e:
             if e.response['Error']['Code'] != 'ThrottlingException':
@@ -134,40 +124,74 @@ class RateLimit:
         return throttle
 
     def get_token(self, bucket_id, bucket_shard_id, usage_plan):
-        """
-        Since this implememntation is for a distributed and scaled system there is no
-        cron process ticking and refilling the buckets. Before we take a token we need 
-        to try refil the bucket shard. We do a conditional update if the time has ticked
-        over. 
-
-        Once bucket has been refilled we reduce the token_count of the shard return the token.
-        """
+        global token
         now = int(time.time() / usage_plan.granularity_in_sec)
-        token = {}
-
+        tokens_in_bucket_shard = 0
+        
+        try:
+            token = self.buckets_table.get_item(
+                Key={'bucket_id': bucket_id, 'bucket_shard_id': bucket_shard_id},
+            )
+            item = token.get('Item',{})
+            tokens_in_bucket_shard = token.get('Item',{}).get('token_count', 0)
+            
+            rate_limit_per_shard = usage_plan.base_tokens_per_shard[bucket_shard_id]
+            
+            if usage_plan.type is 'TokenBucket':
+                refil_cap_per_shard = usage_plan.burst_tokens_per_shard[bucket_shard_id] - rate_limit_per_shard
+            else:
+                refil_cap_per_shard = rate_limit_per_shard
+            
+            if now > item.get('last_updated', 0) and tokens_in_bucket_shard <= refil_cap_per_shard:
+                #refil
+                token = self.refil_tokens(bucket_id, bucket_shard_id, usage_plan, refil_cap_per_shard, now)
+                tokens_in_bucket_shard = token.get('Attributes',{}).get('token_count', 0)
+                
+            elif item.get('token_count', 0) > 0:
+                #subtract
+                token = self.subtract_token(bucket_id, bucket_shard_id, usage_plan, now)
+                tokens_in_bucket_shard = token.get('Attributes',{}).get('token_count', 0)
+            
+            
+                
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                raise         
+        return tokens_in_bucket_shard
+        
+    def refil_tokens(self, bucket_id, bucket_shard_id, usage_plan, refil_cap_per_shard, now):
+        global token
         try:
             #Refill bucket
             rate_limit_per_shard = usage_plan.base_tokens_per_shard[bucket_shard_id]
-            burst_rate_per_shard = usage_plan.burst_tokens_per_shard[bucket_shard_id]
             attributes = {
                     ':now': now,
                     ':rate_limit': rate_limit_per_shard,
                 }
+                
             if usage_plan.type is 'TokenBucket':
-                attributes[':refil_cap'] =  burst_rate_per_shard - rate_limit_per_shard 
-            self.buckets_table.update_item(
+                attributes[':refil_cap'] =  refil_cap_per_shard 
+                condition_expression = 'attribute_not_exists(bucket_id) OR ( :now > last_updated AND (token_count < :refil_cap ) )'
+                update_expression = 'SET last_updated = :now ADD token_count :rate_limit'
+            else:    
+                condition_expression = ':now > last_updated OR attribute_not_exists(bucket_id)'
+                update_expression = 'SET last_updated = :now, token_count = :rate_limit'
+            
+            token =  self.buckets_table.update_item(
                 Key={'bucket_id': bucket_id, 'bucket_shard_id': bucket_shard_id},
-                UpdateExpression=usage_plan.update_expression,
-                ConditionExpression=usage_plan.condition_expression,
+                UpdateExpression=update_expression,
+                ConditionExpression=condition_expression,
                 ExpressionAttributeValues=attributes,
                 ReturnValues='ALL_NEW'
             )
         except botocore.exceptions.ClientError as e:
             if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
                 raise 
-
+        return token
+        
+    def subtract_token(self, bucket_id, bucket_shard_id, usage_plan, now):
+        global token
         try:
-            #Reduce token count
             token =  self.buckets_table.update_item(
                 Key={'bucket_id': bucket_id, 'bucket_shard_id': bucket_shard_id},
                 ExpressionAttributeValues={':mod': -1, ':now': now, ':min_val': 0},
@@ -184,15 +208,8 @@ class RateLimit:
         """
         Metrics are logged using CloudWatch EMF format.
         """
-        if throttle_by_ddb:
-            throttle_by_ddb_count = 1
-        else:
-            throttle_by_ddb_count = 0
-            
-        if throttle:
-            throttle_count = 1
-        else:
-            throttle_count = 0
+        throttle_by_ddb_count = (0, 1)[throttle_by_ddb]
+        throttle_count = (0, 1)[throttle]
         
         print(json.dumps({
             '_aws': {

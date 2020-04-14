@@ -29,6 +29,7 @@ class AppStack(_core.Stack):
         rate_limit_ddb_statement.add_resources(bucket_tokens_table)
         rate_limit_ddb_statement.add_actions('dynamodb:DescribeTable')
         rate_limit_ddb_statement.add_actions('dynamodb:CreateTable')
+        rate_limit_ddb_statement.add_actions('dynamodb:GetItem')
         rate_limit_ddb_statement.add_actions('dynamodb:PutItem')
         rate_limit_ddb_statement.add_actions('dynamodb:UpdateItem')
 
